@@ -1,13 +1,18 @@
 #include <Arduino.h>
-#include <EasyLogger.h>
 #include <NewPing.h>
 #include <Adafruit_NeoPixel.h>
+#include <EEPROM.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
 
+const char* ssid = NULL;
+const char* password = NULL;
+AsyncWebServer server(80);
+
+const byte stripPin = 8;
 const byte triggerPin = 9;
 const byte echoPin = 10;
-const byte echoCount = 1;
-const byte stripPin = 8;
-const byte maxDistance = 200;  //In CM, everything else inches
+const byte maxDistance = 75 /*inches*/ * 2.54; //In CM, everything else inches
 
 const uint32_t red = 0xFF0000;
 const uint32_t yellow = 0xFFFF00;
@@ -39,7 +44,7 @@ enum ParkingState {
   OFF_LONG_HERE
 };
 
-enum DistanceThresholds {
+enum class DistanceThresholds : byte {
   stop3 = 5,
   stop2 = 10,
   stop1 = 15,
@@ -50,11 +55,67 @@ enum DistanceThresholds {
   keepGoing = 50,
 };
 
+enum class DistanceThresholdMemLocation : byte {
+  stop3 = 0,
+  stop2 = 1,
+  stop1 = 2,
+  slow2 = 3,
+  slow1 = 4,
+  keepGoing = 5,
+};
+
+struct DeviceConfiguration{
+  byte stop3;
+  byte stop2;
+  byte stop1;
+  byte slow2;
+  byte slow1;
+  byte keepGoing;
+  bool autoTurnOff;
+  char hostName[24];
+};
+
+const DeviceConfiguration Defaults = {
+  5, 10, 15, 20, 25, 50,
+  true,
+  "device-name-here"
+};
+
+DeviceConfiguration settings;
+
+const char index_html[] PROGMEM = R"rawliteral(
+  <!DOCTYPE HTML>
+  <html><head>
+    <title>ESP Input Form</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+  </head
+  <body>
+  <p>Parking Sensor Web</p>
+  <p>Device: %PLACEHOLDER_DEVICE_NAME%</p>
+  <p>Current Reading: %PLACEHOLDER_CURRENT_DISTANCE% inches</p>
+  <p>&nbsp;</p>
+  <form method="POST" action="/" enctype="multipart/form-data">
+  <p>Network Name: <input id="network_name" maxlength="32" name="network_name" type="text" value="%PLACEHOLDER_DEVICE_NAME%" /></p>
+  <p>Stop 3: <input id="stop_3" maxlength="3" name="stop_3" type="text" value="%PLACEHOLDER_THRESHOLD_STOP_3%" /></p>
+  <p>Stop 2: <input id="stop_2" maxlength="3" name="stop_2" type="text" value="%PLACEHOLDER_THRESHOLD_STOP_2%" /></p>
+  <p>Stop 1: <input id="stop_1" maxlength="3" name="stop_1" type="text" value="%PLACEHOLDER_THRESHOLD_STOP_1%" /></p>
+  <p>Yellow 1: <input id="slow_2" maxlength="3" name="slow_2" type="text" value="%PLACEHOLDER_THRESHOLD_SLOW_2%" /></p>
+  <p>Yellow 2: <input id="slow_1" maxlength="3" name="slow_1" type="text" value="%PLACEHOLDER_THRESHOLD_SLOW_1%" /></p>
+  <p>Keep Going: <input id="keep_going" maxlength="3" name="keep_going" type="text" value="%PLACEHOLDER_THRESHOLD_GO%" /></p>
+  <p>Auto turn off LEDs: <input id="autoTurnOffLEDs" name="autoTurnOffLEDs" type="checkbox" %PLACEHOLDER_AUTO_TURN_OFF% /></p>
+  <p><input id="submitButton" type="submit" value="Save Config &amp; Reboot" /></p>
+  </form>
+  </body></html>
+)rawliteral";
+
+void setupWifi();
 void setState(ParkingState state);
 void setupLed();
 void displayState();
 void turnAllOff();
 void animateWelcome();
+String processor(const String& var);
+DeviceConfiguration readConfig();
 
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(ledCount, stripPin, NEO_GRB + NEO_KHZ800);
 bool welcomeState[ledCount];
@@ -63,20 +124,164 @@ NewPing sonar(triggerPin, echoPin, maxDistance);
 int welcomeDelayCounter = 0;
 unsigned long lastSubstantialChangeTime = millis();
 unsigned long ledTimeout = 5 * 60 * 1000; //5 minutes
-//unsigned long ledTimeout = 30 * 1000;  // 30 seconds - for testing
+
+String processor(const String& var)
+{ 
+  if(var == "PLACEHOLDER_DEVICE_NAME"){
+    return WiFi.getHostname();
+  } else if( var == "PLACEHOLDER_CURRENT_DISTANCE") {
+    long distance = sonar.ping_in();
+    return String(distance);
+  } else if(var == "PLACEHOLDER_THRESHOLD_STOP_3"){
+    return String(settings.stop3);
+  } else if(var == "PLACEHOLDER_THRESHOLD_STOP_2"){
+    return String(settings.stop2);
+  } else if(var == "PLACEHOLDER_THRESHOLD_STOP_1"){
+    return String(settings.stop1);
+  } else if(var == "PLACEHOLDER_THRESHOLD_SLOW_2"){
+    return String(settings.slow2);
+  } else if(var == "PLACEHOLDER_THRESHOLD_SLOW_1"){
+    return String(settings.slow1);
+  } else if(var == "PLACEHOLDER_THRESHOLD_GO"){
+    return String(settings.keepGoing);
+  } else if(var == "PLACEHOLDER_AUTO_TURN_OFF"){
+    if( settings.autoTurnOff){
+      return String("Checked");
+    } else {
+      return String();
+    }
+  }
+ 
+  Serial.println(var);
+  return String();
+}
+
+byte convertStringToByte(const String& inputString) {
+    byte result = 0;
+    for (int i = 0; i < inputString.length(); ++i) {
+        char digitChar = inputString[i];
+        if (isdigit(digitChar)) {
+            result = result * 10 + (digitChar - '0');
+        }
+    }
+    return result;
+}
 
 void setup() {
   Serial.begin(115200);
 
+  Serial.println("setup()");
+
+  EEPROM.begin(64);
+  settings = readConfig();
+  setupWifi();
   setupLed();
 
-  LOG_INFO("SETUP", "Setup Complete")
+   server.on("/", HTTP_POST, [](AsyncWebServerRequest *request)
+   {
+      bool rebootRequired = false;
+      bool autoTurnOffEncountered = false;
+      int params = request->params();
+
+      for(int i=0;i<params;i++){
+        AsyncWebParameter* p = request->getParam(i);
+
+        if( p->name() == "stop_3")
+          settings.stop3 = convertStringToByte(p->value());
+        else if( p->name() == "stop_2")
+          settings.stop2 = convertStringToByte(p->value());
+        else if( p->name() == "stop_1")
+          settings.stop1 = convertStringToByte(p->value());
+        else if( p->name() == "slow_2")
+          settings.slow2 = convertStringToByte(p->value());
+        else if( p->name() == "slow_1")
+          settings.slow1 = convertStringToByte(p->value());
+        else if( p->name() == "keep_going")
+          settings.keepGoing = convertStringToByte(p->value());
+        else if( p->name() == "network_name"){
+          if( WiFi.getHostname() != p->value()){
+            char* source = (char*)(p->value().c_str());
+            strncpy(settings.hostName, source, strlen(source));
+            Serial.println("Set name:");
+            Serial.println(settings.hostName);
+            rebootRequired = true;
+          }
+        }
+        else if (p->name() == "autoTurnOffLEDs"){
+          autoTurnOffEncountered = true;
+          if( p->value() == "on"){
+            settings.autoTurnOff = true;
+          } 
+          else {
+            //I doubt this will be used:
+            settings.autoTurnOff = false;
+          }
+        }
+        else {
+          Serial.println("Unused values:");
+          Serial.println(p->name());
+          Serial.println(p->value());
+        }
+      }
+
+      if( autoTurnOffEncountered == false){
+        settings.autoTurnOff = false;
+      }
+
+      EEPROM.put( 0, settings );
+      EEPROM.commit();
+
+      request->send_P(200, "text/html", index_html, processor);
+
+      if( rebootRequired){
+        ESP.restart();
+      }
+   });
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html, processor);
+  });
+ 
+  server.begin();
 }
 
+void setupWifi() {
+  if( ssid == NULL && password == NULL){
+    Serial.println("Skipping wifi & server config");  
+    return;
+  }
+  
+  Serial.print("Attempting hostname: ");
+  Serial.println(settings.hostName);
+  
+  WiFi.setHostname(settings.hostName);
+  WiFi.begin(ssid, password);
+  int attemptCount = 0;
+
+  // Wait for connection
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    attemptCount++;
+
+    if( attemptCount > 10){
+      Serial.println("Failed to connect to wifi.");
+      return;
+    }
+  }
+  
+  Serial.println("");
+  Serial.print("Connected to ");
+  Serial.println(ssid);
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("Hostname: ");
+  Serial.println(WiFi.getHostname());
+
+  server.begin();
+}
 
 void setupLed(){
-  LOG_INFO("setupLed", "LED setup")
-
   strip.begin();
   strip.setBrightness(40);
   strip.fill(strip.Color(255, 0, 255), 0, 10);
@@ -88,29 +293,37 @@ void setupLed(){
       welcomeState[x] = true;
     }
   }
-
-  LOG_INFO("setupLed", "Done with LED setup")
 }
+ 
+DeviceConfiguration readConfig() {
+  DeviceConfiguration config;
+  EEPROM.get( 0, config );
 
+  if( config.stop3 == 0 && config.stop2 == 0 && config.stop1 == 0){
+    Serial.println("Unhappy, using defaults.");
+    return Defaults;
+  }
+
+  return config;
+}
 
 void loop() {
   long distance = sonar.ping_in();
-  unsigned long startTime = millis();
   if (distance == 0) {
     distance = maxDistance;
   }
   
-  if (distance < DistanceThresholds::stop3) {
+  if (settings.stop3 != 0 && distance < settings.stop3) {
     setState(ParkingState::STOP_3);
-  } else if (distance < DistanceThresholds::stop2) {
+  } else if (settings.stop2 != 0 && distance < settings.stop2) {
     setState(ParkingState::STOP_2);
-  } else if (distance < DistanceThresholds::stop1) {
+  } else if (settings.stop1 != 0 && distance < settings.stop1) {
     setState(ParkingState::STOP_1);
-  } else if (distance < DistanceThresholds::slow2) {
+  } else if (settings.slow2 != 0 && distance < settings.slow2) {
     setState(ParkingState::SLOW_DOWN_2);
-  } else if (distance < DistanceThresholds::slow1) {
+  } else if (settings.slow1 != 0 && distance < settings.slow1) {
     setState(ParkingState::SLOW_DOWN_1);
-  } else if (distance < DistanceThresholds::keepGoing) {
+  } else if (settings.keepGoing != 0 && distance < settings.keepGoing) {
     setState(ParkingState::KEEP_GOING);
   } else {
     setState(ParkingState::WELCOMING);
@@ -148,7 +361,7 @@ void setState(ParkingState state) {
 
 void displayState() {
   unsigned long timeSinceLastChange = millis() - lastSubstantialChangeTime;
-  if (timeSinceLastChange > ledTimeout) {
+  if (settings.autoTurnOff && timeSinceLastChange > ledTimeout) {
     turnAllOff();
     return;
   }
