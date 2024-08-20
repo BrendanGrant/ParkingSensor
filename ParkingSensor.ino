@@ -4,10 +4,24 @@
 #include <EEPROM.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
+#include <PubSubClient.h>
+
+/*Needed libs:
+  * PubSubClient
+  * Adafruit NeoPixel
+  * AsyncTCP
+  * ESP Async WebServer
+  * NewPing
+*/  
 
 const char* ssid = NULL;
 const char* password = NULL;
 AsyncWebServer server(80);
+
+WiFiClient wifiClientThingie;
+PubSubClient mqttClient(wifiClientThingie);
+
+const byte eePromSize = 128;
 
 const byte stripPin = 8;
 const byte triggerPin = 9;
@@ -73,12 +87,18 @@ struct DeviceConfiguration{
   byte keepGoing;
   bool autoTurnOff;
   char hostName[24];
+  bool enableMQTT;
+  char mqttServer[64];
+  unsigned short mqttPort;
 };
 
 const DeviceConfiguration Defaults = {
   5, 10, 15, 20, 25, 50,
   true,
-  "device-name-here"
+  "device-name-here",
+  false,
+  "",
+  18830,
 };
 
 DeviceConfiguration settings;
@@ -86,7 +106,7 @@ DeviceConfiguration settings;
 const char index_html[] PROGMEM = R"rawliteral(
   <!DOCTYPE HTML>
   <html><head>
-    <title>ESP Input Form</title>
+    <title>Parking Sensor Web Page</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
   </head
   <body>
@@ -99,10 +119,13 @@ const char index_html[] PROGMEM = R"rawliteral(
   <p>Stop 3: <input id="stop_3" maxlength="3" name="stop_3" type="text" value="%PLACEHOLDER_THRESHOLD_STOP_3%" /></p>
   <p>Stop 2: <input id="stop_2" maxlength="3" name="stop_2" type="text" value="%PLACEHOLDER_THRESHOLD_STOP_2%" /></p>
   <p>Stop 1: <input id="stop_1" maxlength="3" name="stop_1" type="text" value="%PLACEHOLDER_THRESHOLD_STOP_1%" /></p>
-  <p>Yellow 1: <input id="slow_2" maxlength="3" name="slow_2" type="text" value="%PLACEHOLDER_THRESHOLD_SLOW_2%" /></p>
-  <p>Yellow 2: <input id="slow_1" maxlength="3" name="slow_1" type="text" value="%PLACEHOLDER_THRESHOLD_SLOW_1%" /></p>
+  <p>Yellow 2: <input id="slow_2" maxlength="3" name="slow_2" type="text" value="%PLACEHOLDER_THRESHOLD_SLOW_2%" /></p>
+  <p>Yellow 1: <input id="slow_1" maxlength="3" name="slow_1" type="text" value="%PLACEHOLDER_THRESHOLD_SLOW_1%" /></p>
   <p>Keep Going: <input id="keep_going" maxlength="3" name="keep_going" type="text" value="%PLACEHOLDER_THRESHOLD_GO%" /></p>
   <p>Auto turn off LEDs: <input id="autoTurnOffLEDs" name="autoTurnOffLEDs" type="checkbox" %PLACEHOLDER_AUTO_TURN_OFF% /></p>
+  <p>Enable MQTT Reporting: <input id="enableMQTT" name="enableMQTT" type="checkbox" %PLACEHOLDER_MQTT_ENABLE% /></p>
+  <p>MQTT Server: <input id="mqtt_server" maxlength="64" name="mqtt_server" type="text" value="%PLACEHOLDER_MQTT_SERVER%" /></p>
+  <p>MQTT Port: <input id="mqtt_port" maxlength="5" name="mqtt_port" type="text" value="%PLACEHOLDER_MQTT_PORT%" /></p>
   <p><input id="submitButton" type="submit" value="Save Config &amp; Reboot" /></p>
   </form>
   </body></html>
@@ -150,9 +173,17 @@ String processor(const String& var)
     } else {
       return String();
     }
+  } else if(var == "PLACEHOLDER_MQTT_ENABLE"){
+    if( settings.enableMQTT){
+      return String("Checked");
+    } else {
+      return String();
+    }
+  } else if(var == "PLACEHOLDER_MQTT_SERVER"){
+    return String(settings.mqttServer);
+  } else if(var == "PLACEHOLDER_MQTT_PORT"){
+    return String(settings.mqttPort);
   }
- 
-  Serial.println(var);
   return String();
 }
 
@@ -167,12 +198,24 @@ byte convertStringToByte(const String& inputString) {
     return result;
 }
 
+//TODO: simplify these both
+unsigned short convertStringToUShort(const String& inputString) {
+    int result = 0;
+    for (int i = 0; i < inputString.length(); ++i) {
+        char digitChar = inputString[i];
+        if (isdigit(digitChar)) {
+            result = result * 10 + (digitChar - '0');
+        }
+    }
+    return result;
+}
+
 void setup() {
   Serial.begin(115200);
 
   Serial.println("setup()");
 
-  EEPROM.begin(64);
+  EEPROM.begin(eePromSize);
   settings = readConfig();
   setupWifi();
   setupLed();
@@ -181,10 +224,11 @@ void setup() {
    {
       bool rebootRequired = false;
       bool autoTurnOffEncountered = false;
+      bool enableMQTTEncountered = false;
       int params = request->params();
 
       for(int i=0;i<params;i++){
-        AsyncWebParameter* p = request->getParam(i);
+        const AsyncWebParameter* p = request->getParam(i);
 
         if( p->name() == "stop_3")
           settings.stop3 = convertStringToByte(p->value());
@@ -202,22 +246,44 @@ void setup() {
           if( WiFi.getHostname() != p->value()){
             char* source = (char*)(p->value().c_str());
             strncpy(settings.hostName, source, strlen(source));
+            settings.hostName[strlen(source)] = '\0'; //Do I really need to null terminate incomming strings?
             Serial.println("Set name:");
             Serial.println(settings.hostName);
             rebootRequired = true;
           }
         }
         else if (p->name() == "autoTurnOffLEDs"){
-          autoTurnOffEncountered = true;
           if( p->value() == "on"){
             settings.autoTurnOff = true;
           } 
-          else {
-            //I doubt this will be used:
-            settings.autoTurnOff = false;
+          //If we don't see the variable as part of submission, we can assume it's set to off,
+          //and will set it if we haven't seen it later, because we haven't set:
+          autoTurnOffEncountered = true;
+        }
+        else if( p->name() == "enableMQTT"){
+          if( p->value() == "on"){
+            settings.enableMQTT = true;
+	    rebootRequired = true;
+          } 
+          //If we don't see the variable as part of submission, we can assume it's set to off,
+          //and will set it if we haven't seen it later, because we haven't set:
+          enableMQTTEncountered = true;
+        }
+        else if( p->name() == "mqtt_server"){
+          if( WiFi.getHostname() != p->value()){
+            char* source = (char*)(p->value().c_str());
+            strncpy(settings.mqttServer, source, strlen(source));
+            settings.mqttServer[strlen(source)] = '\0'; //Do I really need to null terminate incomming strings?
+
+            Serial.println("Set new MQTT Server host name:");
+            Serial.println(settings.mqttServer);
+            rebootRequired = true;
           }
         }
-        else {
+        else if( p->name() == "mqtt_port"){
+          settings.mqttPort = convertStringToUShort(p->value());
+          rebootRequired = true;
+        } else {
           Serial.println("Unused values:");
           Serial.println(p->name());
           Serial.println(p->value());
@@ -226,6 +292,10 @@ void setup() {
 
       if( autoTurnOffEncountered == false){
         settings.autoTurnOff = false;
+      }
+      if( enableMQTTEncountered == false){
+        settings.enableMQTT = false;
+        rebootRequired = true;
       }
 
       EEPROM.put( 0, settings );
@@ -243,6 +313,26 @@ void setup() {
   });
  
   server.begin();
+}
+
+
+void reconnectToMQTT() {
+  int retryCount = 0;
+  // Loop until we're reconnected
+  while (!mqttClient.connected() && retryCount <= 10) {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (mqttClient.connect(settings.hostName)) {
+      Serial.println("MQTT connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" try again in 250 ms");
+      // Wait 1/4 second before retrying
+      delay(250);
+      retryCount++;
+    }
+  }
 }
 
 void setupWifi() {
@@ -278,6 +368,15 @@ void setupWifi() {
   Serial.print("Hostname: ");
   Serial.println(WiFi.getHostname());
 
+  if( settings.enableMQTT){
+    IPAddress serverIp;
+    if( serverIp.fromString(settings.mqttServer)){
+      mqttClient.setServer(serverIp, settings.mqttPort);
+    } else {
+      mqttClient.setServer(settings.mqttServer, settings.mqttPort);
+    }
+    reconnectToMQTT();
+  }
   server.begin();
 }
 
@@ -294,12 +393,14 @@ void setupLed(){
     }
   }
 }
- 
+
 DeviceConfiguration readConfig() {
   DeviceConfiguration config;
   EEPROM.get( 0, config );
 
-  if( config.stop3 == 0 && config.stop2 == 0 && config.stop1 == 0){
+  //TODO: Determine which state is default/empty
+  if( (config.stop3 == 0 && config.stop2 == 0 && config.stop1 == 0) ||
+      (config.stop3 == 255 && config.stop2 == 255 && config.stop1 == 255)){
     Serial.println("Unhappy, using defaults.");
     return Defaults;
   }
@@ -354,6 +455,19 @@ void setState(ParkingState state) {
     substantiveChange = true;
     welcomeDelayCounter = 0;  //Reset
     lastSubstantialChangeTime = millis();
+
+    if( settings.enableMQTT){
+      char topicName[100];
+      //topic string for vehicle presence 
+      sprintf(topicName, "home/garage/%s/status/vehicle-present", settings.hostName);
+      
+      reconnectToMQTT(); //If not already
+      if( (state & BIT_STOP) == BIT_STOP){
+        mqttClient.publish(topicName, "true");
+      } else{
+        mqttClient.publish(topicName, "false");
+      }
+    }
   }
 
   currentState = state;
@@ -410,8 +524,8 @@ void animateWelcome() {
   }
 
   welcomeState[ledCount-1] = first;
-  uint32_t color = welcomeState[ledCount] ? green : black;
-  strip.setPixelColor(ledCount, color);
+  uint32_t color = welcomeState[ledCount-1] ? green : black;
+  strip.setPixelColor(ledCount-1, color);
   strip.show();
 }
 
